@@ -1,4 +1,4 @@
-const CACHE = "sansle-v1";
+const CACHE = "sansle-v2";
 const SHELL = ["./", "index.html", "manifest.webmanifest", "icon-192.png", "icon-512.png", "apple-touch-icon.png"];
 
 self.addEventListener("install", (e) => {
@@ -10,6 +10,8 @@ self.addEventListener("activate", (e) => {
 /* Pages come from the network when possible, so updates arrive, and from the cache when offline. Everything else is cache first. */
 self.addEventListener("fetch", (e) => {
   if (e.request.method !== "GET") return;
+  /* Account data must always be live, never a cached copy. */
+  if (new URL(e.request.url).hostname.endsWith(".supabase.co")) return;
   const save = (res) => {
     if (res && (res.ok || res.type === "opaque")) {
       const copy = res.clone();

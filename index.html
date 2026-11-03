@@ -209,6 +209,7 @@ input, select { min-height: 52px; width: 100%; min-width: 0; padding: 0 12px; bo
     <button class="p-toggle" id="p-hidden-toggle" type="button" aria-expanded="false"><span>Hidden</span><span id="p-hidden-count"></span></button>
     <ul class="p-list" id="p-hidden" hidden></ul>
   </div>
+  <button class="p-toggle" id="p-account" type="button" hidden><span id="p-account-label">Sign in to sync</span></button>
 </aside>
 
 <div class="app" id="app">
@@ -292,6 +293,29 @@ input, select { min-height: 52px; width: 100%; min-width: 0; padding: 0 12px; bo
       <div class="row">
         <button class="btn" data-close type="button">Keep going</button>
         <button class="quiet" id="do-reset" type="button">Reset to zero</button>
+      </div>
+    </section>
+    <form id="sh-account" novalidate hidden>
+      <h3>Keep your data</h3>
+      <p class="muted">Sign in and your streaks follow you to any device.</p>
+      <div class="field"><label for="a-email">Email</label><input id="a-email" type="email" autocomplete="username" inputmode="email" maxlength="200"></div>
+      <div class="field"><label for="a-pass">Password</label><input id="a-pass" type="password" autocomplete="current-password" maxlength="72"></div>
+      <p class="muted">At least 8 characters. Passwords can't be reset yet, so keep yours in a password manager.</p>
+      <p class="err" id="a-err" hidden></p>
+      <div class="row">
+        <button class="btn" id="a-in" type="submit">Sign in</button>
+        <button class="quiet" id="a-new" type="button">Create account</button>
+      </div>
+      <button class="quiet" data-close type="button">Not now</button>
+    </form>
+    <section id="sh-me" hidden>
+      <h3>Your account</h3>
+      <p class="muted" id="me-email"></p>
+      <p class="muted">Signing out removes your data from this device. It stays in your account.</p>
+      <p class="err" id="me-err" hidden></p>
+      <div class="row">
+        <button class="btn" data-close type="button">Done</button>
+        <button class="quiet" id="me-out" type="button">Sign out</button>
       </div>
     </section>
     <form id="sh-project" novalidate hidden>
@@ -395,10 +419,16 @@ input, select { min-height: 52px; width: 100%; min-width: 0; padding: 0 12px; bo
     store.updatedAt = Date.now();
     if (!synced) dirty = true;
     saveLocal();
+    if (cloudOn) { edits++; sync.dirty = true; saveSync(); }
     queueSave();
   }
   function commit() { touch(); render(); }
   function queueSave() {
+    if (cloudOn) {
+      clearTimeout(timer);
+      timer = setTimeout(cloudSync, 400);
+      return;
+    }
     if (!ref || !synced) return;
     clearTimeout(timer);
     timer = setTimeout(flush, 400);
@@ -430,8 +460,14 @@ input, select { min-height: 52px; width: 100%; min-width: 0; padding: 0 12px; bo
     var merged = clone(localNewer ? store : remote), other = localNewer ? remote : store;
     other.projects.forEach(function (o) {
       var mine = merged.projects.filter(function (x) { return x.id === o.id; })[0];
-      if (mine) mine.urges = mergeUrges(mine.urges, o.urges);
-      else merged.projects.push(clone(o));
+      if (!mine) { merged.projects.push(clone(o)); return; }
+      mine.urges = mergeUrges(mine.urges, o.urges);
+      /* Two devices may add goals or milestones at once. Keep both sides' additions. */
+      ["goals", "milestones"].forEach(function (k) {
+        o[k].forEach(function (item) {
+          if (!mine[k].some(function (x) { return x.id === item.id; })) mine[k].push(clone(item));
+        });
+      });
     });
     return merged;
   }
@@ -465,8 +501,237 @@ input, select { min-height: 52px; width: 100%; min-width: 0; padding: 0 12px; bo
     if (!document.activeElement || !document.activeElement.closest("#goal-list, #goal-form, .sheet")) render();
   }
 
+  /* ---------- Accounts: email and password, one private row per person ---------- */
+  var CLOUD = { url: "https://mhdliqisvgbqktrztmhf.supabase.co", key: "sb_publishable_PARpYQ3lnXio9CBGDe0MOQ_XQmsxiuK" };
+  var SESSION_KEY = "sansle.session", SYNC_KEY = "sansle.sync", ASKED_KEY = "sansle.asked";
+  var cloudOn = false, syncing = null, syncAgain = false, refreshing = null, edits = 0;
+  function readJson(k) {
+    try { var raw = localStorage.getItem(k); if (raw) return JSON.parse(raw); } catch (e) {}
+    return null;
+  }
+  function writeJson(k, v) { try { if (v) localStorage.setItem(k, JSON.stringify(v)); else localStorage.removeItem(k); } catch (e) {} }
+  var session = readJson(SESSION_KEY);
+  /* rev is the last version of the account this device has seen. Anything already on the device counts as unsaved until its first sync. */
+  var sync = readJson(SYNC_KEY) || { owner: null, rev: 0, joined: false, dirty: store.updatedAt > 0 };
+  function saveSync() { writeJson(SYNC_KEY, sync); }
+
+  function authPost(path, body) {
+    return fetch(CLOUD.url + "/auth/v1/" + path, {
+      method: "POST",
+      headers: { apikey: CLOUD.key, "Content-Type": "application/json" },
+      body: JSON.stringify(body)
+    }).then(function (res) {
+      if (res.ok) return res.json();
+      return res.json().catch(function () { return {}; }).then(function (d) {
+        var e = new Error("auth " + res.status);
+        e.status = res.status;
+        e.code = d.error_code || d.code;
+        throw e;
+      });
+    });
+  }
+  function setSession(d) {
+    session = { access: d.access_token, refresh: d.refresh_token, expires: Date.now() + d.expires_in * 1000, id: d.user.id, email: d.user.email };
+    writeJson(SESSION_KEY, session);
+  }
+  function endSession() {
+    session = null;
+    writeJson(SESSION_KEY, null);
+    renderAccount();
+    setStatus("Signed out of your account. Changes are saved on this device. Sign in to sync them.");
+  }
+  function token() {
+    if (!session) return Promise.reject(new Error("signed out"));
+    if (session.expires > Date.now() + 60000) return Promise.resolve(session.access);
+    if (!refreshing) {
+      refreshing = authPost("token?grant_type=refresh_token", { refresh_token: session.refresh }).then(function (d) {
+        setSession(d);
+        refreshing = null;
+        return session.access;
+      }, function (e) {
+        refreshing = null;
+        if (e.status === 400 || e.status === 401) endSession();
+        throw e;
+      });
+    }
+    return refreshing;
+  }
+  function api(path, body, retried) {
+    return token().then(function (t) {
+      return fetch(CLOUD.url + "/rest/v1/" + path, {
+        method: body ? "POST" : "GET",
+        cache: "no-store",
+        headers: { apikey: CLOUD.key, Authorization: "Bearer " + t, "Content-Type": "application/json" },
+        body: body ? JSON.stringify(body) : undefined
+      });
+    }).then(function (res) {
+      if (res.status === 401 && !retried && session) {
+        session.expires = 0;
+        return api(path, body, true);
+      }
+      if (!res.ok) throw new Error("api " + res.status);
+      return res.json();
+    });
+  }
+
+  /* The first time a device meets an account the two may hold separate histories, so for a shared project the longer streak wins and nothing else is dropped. */
+  function firstMerge(remote) {
+    var merged = clone(remote);
+    store.projects.forEach(function (o) {
+      var i = -1;
+      merged.projects.forEach(function (x, n) { if (x.id === o.id) i = n; });
+      if (i < 0) { merged.projects.push(clone(o)); return; }
+      var theirs = merged.projects[i], keep = clone(o.start < theirs.start ? o : theirs), seen = {};
+      keep.urges = mergeUrges(o.urges, theirs.urges);
+      keep.runs = (o.runs || []).concat(theirs.runs || []).filter(function (run) {
+        if (seen[run.start]) return false;
+        seen[run.start] = true;
+        return true;
+      }).sort(function (a, b) { return a.start - b.start; });
+      merged.projects[i] = keep;
+    });
+    return merged;
+  }
+  function refresh() {
+    if (!document.activeElement || !document.activeElement.closest("#goal-list, #goal-form, .sheet")) render();
+  }
+  function syncStep(tries) {
+    return api("user_state?select=data,rev&user_id=eq." + session.id).then(function (rows) {
+      var row = rows[0];
+      if (row && row.rev > sync.rev) {
+        var remote = normalize(row.data);
+        if (sync.dirty) {
+          store = sync.joined ? mergeIn(remote) : firstMerge(remote);
+          store.updatedAt = Date.now();
+        } else {
+          store = remote;
+        }
+        sync.rev = row.rev;
+        sync.joined = true;
+        state = current();
+        saveLocal();
+        saveSync();
+        refresh();
+      }
+      if (row ? !sync.dirty : !store.updatedAt) return;
+      var seen = edits;
+      return api("rpc/save_state", { p_data: packed(), p_rev: sync.rev }).then(function (rev) {
+        /* No version back means another device saved first: read that, merge, try again. */
+        if (rev === null) {
+          if (!tries) throw new Error("conflict");
+          return syncStep(tries - 1);
+        }
+        sync.rev = rev;
+        sync.joined = true;
+        if (edits === seen) sync.dirty = false;
+        saveSync();
+      });
+    });
+  }
+  function cloudSync(force) {
+    if (!cloudOn || !session) return Promise.resolve(false);
+    if (force !== true && !$("sheet-wrap").hidden) return Promise.resolve(false);
+    if (syncing) { syncAgain = true; return syncing; }
+    syncing = syncStep(3).then(function () {
+      setStatus("Saved to your account.");
+      return true;
+    }, function () {
+      if (session) setStatus(navigator.onLine === false ? "Offline. Changes are saved on this device and will sync when you're back." : "Can't reach your account right now. Changes are saved on this device.");
+      return false;
+    }).then(function (ok) {
+      syncing = null;
+      if (syncAgain) { syncAgain = false; return cloudSync(force); }
+      return ok;
+    });
+    return syncing;
+  }
+  function renderAccount() {
+    $("p-account").hidden = !cloudOn;
+    $("p-account-label").textContent = session ? session.email : "Sign in to sync";
+  }
+  function formError(id, t) { $(id).textContent = t; $(id).hidden = !t; }
+  function openAccount() {
+    formError("a-err", "");
+    formError("me-err", "");
+    if (session) $("me-email").textContent = session.email;
+    openSheet(session ? "sh-me" : "sh-account");
+  }
+  function enter(path) {
+    var email = $("a-email").value.trim(), password = $("a-pass").value;
+    if (email.indexOf("@") < 1) { formError("a-err", "Enter your email address."); return; }
+    if (password.length < 8) { formError("a-err", "Use a password of at least 8 characters."); return; }
+    formError("a-err", "");
+    $("a-in").disabled = $("a-new").disabled = true;
+    authPost(path, { email: email, password: password }).then(function (d) {
+      /* New accounts confirm their email first, so sign-up hands back no session. */
+      if (!d.access_token) { formError("a-err", "Almost there. Tap the link we just emailed you (check spam), then come back and sign in here."); return; }
+      setSession(d);
+      $("a-pass").value = "";
+      /* A different person signing in on this device must never inherit or upload the last person's data. */
+      if (sync.owner && sync.owner !== session.id) {
+        store = normalize(fresh());
+        state = current();
+        saveLocal();
+        sync = { owner: null, rev: 0, joined: false, dirty: false };
+      }
+      sync.owner = session.id;
+      saveSync();
+      renderAccount();
+      closeSheet();
+      setStatus("Connecting to your account…");
+      render();
+      cloudSync(true);
+    }, function (err) {
+      if (!err.status) formError("a-err", "No connection. Try again when you're online.");
+      else if (err.status === 429) formError("a-err", "Too many tries. Wait a few minutes and try again.");
+      else if (err.code === "email_address_not_authorized") formError("a-err", "This email address can't be used yet.");
+      else if (err.code === "email_not_confirmed") formError("a-err", "Tap the link we emailed you first, then sign in here.");
+      else if (path === "signup") formError("a-err", err.code === "user_already_exists" ? "That email already has an account. Sign in instead." : "Couldn't create that account. Try a longer password.");
+      else formError("a-err", "Wrong email or password.");
+    }).then(function () { $("a-in").disabled = $("a-new").disabled = false; });
+  }
+  function signOut() {
+    $("me-out").disabled = true;
+    formError("me-err", "");
+    (sync.dirty ? cloudSync(true) : Promise.resolve(true)).then(function (ok) {
+      $("me-out").disabled = false;
+      if (!ok || sync.dirty) { formError("me-err", "Some changes aren't saved to your account yet. Go online and try again."); return; }
+      token().then(function (t) {
+        return fetch(CLOUD.url + "/auth/v1/logout", { method: "POST", headers: { apikey: CLOUD.key, Authorization: "Bearer " + t } });
+      }).catch(function () {});
+      setTimeout(function () {
+        session = null;
+        writeJson(SESSION_KEY, null);
+        sync = { owner: null, rev: 0, joined: false, dirty: false };
+        writeJson(SYNC_KEY, null);
+        store = normalize(fresh());
+        state = current();
+        saveLocal();
+        closeSheet();
+        renderAccount();
+        setStatus("Saved on this device.");
+        render();
+      }, 0);
+    });
+  }
+  function cloudStart() {
+    cloudOn = true;
+    /* The confirmation link lands here with sign-in details in the address. Don't leave them there. */
+    if (location.hash.length > 1) history.replaceState(null, "", location.pathname + location.search);
+    renderAccount();
+    if (session) {
+      setStatus("Connecting to your account…");
+      cloudSync();
+    } else if (!readJson(ASKED_KEY)) {
+      writeJson(ASKED_KEY, true);
+      openAccount();
+    }
+    window.addEventListener("online", function () { cloudSync(); });
+    document.addEventListener("visibilitychange", function () { cloudSync(); });
+  }
+
   function connect() {
-    if (!window.claude || !window.claude.use) return;
+    if (!window.claude || !window.claude.use) { cloudStart(); return; }
     Promise.all([window.claude.use("db"), window.claude.use("user")]).then(function (r) {
       var db = r[0], user = r[1];
       if (!db || !user) return null;
@@ -990,7 +1255,7 @@ input, select { min-height: 52px; width: 100%; min-width: 0; padding: 0 12px; bo
 
   /* ---------- Sheets ---------- */
   function openSheet(id) {
-    ["sh-reset", "sh-start", "sh-ms", "sh-project"].forEach(function (s) { $(s).hidden = s !== id; });
+    ["sh-reset", "sh-start", "sh-ms", "sh-project", "sh-account", "sh-me"].forEach(function (s) { $(s).hidden = s !== id; });
     $("sheet-wrap").hidden = false;
   }
   function closeSheet() { $("sheet-wrap").hidden = true; }
@@ -1193,6 +1458,10 @@ input, select { min-height: 52px; width: 100%; min-width: 0; padding: 0 12px; bo
     setSide(false);
   });
   $("p-add").addEventListener("click", function () { openProject(null); });
+  $("p-account").addEventListener("click", function () { setSide(false); openAccount(); });
+  $("sh-account").addEventListener("submit", function (e) { e.preventDefault(); enter("token?grant_type=password"); });
+  $("a-new").addEventListener("click", function () { enter("signup"); });
+  $("me-out").addEventListener("click", signOut);
   $("p-open").addEventListener("click", function () { setSide(true); });
   $("scrim").addEventListener("click", function () { setSide(false); });
   $("p-hidden-toggle").addEventListener("click", function () { hiddenOpen = !hiddenOpen; renderProjects(); });
