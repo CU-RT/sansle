@@ -663,6 +663,8 @@ input, select { min-height: 52px; width: 100%; min-width: 0; padding: 0 12px; bo
     formError("a-err", "");
     $("a-in").disabled = $("a-new").disabled = true;
     authPost(path, { email: email, password: password }).then(function (d) {
+      /* An email that already has a confirmed account comes back with no identities and no new email is sent. */
+      if (!d.access_token && d.identities && !d.identities.length) { formError("a-err", "That email already has an account. Sign in instead."); return; }
       /* New accounts confirm their email first, so sign-up hands back no session. */
       if (!d.access_token) { formError("a-err", "Almost there. Tap the link we just emailed you (check spam), then come back and sign in here."); return; }
       setSession(d);
@@ -716,12 +718,20 @@ input, select { min-height: 52px; width: 100%; min-width: 0; padding: 0 12px; bo
   }
   function cloudStart() {
     cloudOn = true;
-    /* The confirmation link lands here with sign-in details in the address. Don't leave them there. */
-    if (location.hash.length > 1) history.replaceState(null, "", location.pathname + location.search);
+    /* The confirmation link lands here with its result in the address. Read it, take it out of the address, and ask for the password: a sign-in carried by a link could belong to someone else's account. */
+    var landed = location.hash.length > 1 ? new URLSearchParams(location.hash.slice(1)) : null;
+    if (landed) history.replaceState(null, "", location.pathname + location.search);
+    var linkNote = !landed ? "" : landed.get("error") || landed.get("error_code")
+      ? "That link has expired or was already used. Try signing in. If that doesn't work, tap Create account to get a new link."
+      : landed.get("access_token") ? "Email confirmed. Sign in to finish." : "";
     renderAccount();
     if (session) {
       setStatus("Connecting to your account…");
       cloudSync();
+    } else if (linkNote) {
+      writeJson(ASKED_KEY, true);
+      openAccount();
+      formError("a-err", linkNote);
     } else if (!readJson(ASKED_KEY)) {
       writeJson(ASKED_KEY, true);
       openAccount();
